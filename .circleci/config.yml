@@ -1,0 +1,173 @@
+version: 2.1
+# Use a package of configuration called an orb.
+
+
+commands:
+
+  # Exercise - Rollback
+  destroy_environment:
+    steps:
+      - run: # Install the AWS CLI if it is not already included in the docker image
+          name: Install awscli
+          when: on_fail
+          command: pip install awscli
+      - run:
+          name: Destroy environment
+          when: on_fail
+          command: |
+            aws cloudformation delete-stack --stack-name myStack-${CIRCLE_WORKFLOW_ID:0:7}
+            
+
+                       
+jobs:
+
+
+  create_and_deploy_front_end:
+    docker:
+    - image: amazon/aws-cli
+    steps:
+    - checkout
+    - run:
+        name: Execute bucket.yml - Create Cloudformation Stack
+        command: |
+          aws cloudformation deploy \
+          --template-file bucket.yml \
+          --stack-name stack-create-bucket-${CIRCLE_WORKFLOW_ID:0:7} \
+          --parameter-overrides MyBucketName="mybucket-${CIRCLE_WORKFLOW_ID:0:7}"
+    # Uncomment the step below if yoou wish to upload all contents of the current directory to the S3 bucket
+    - run: aws s3 sync . s3://mybucket-${CIRCLE_WORKFLOW_ID:0:7} --delete 
+
+
+  get_last_deployment_id:
+    docker:
+      - image: amazon/aws-cli
+    steps:
+      - checkout
+      - run: yum install -y tar gzip
+      - run:
+          name: Fetch and save the old pipeline ID (bucket name) responsible for the last release.
+          command: |
+            aws cloudformation \
+            list-exports --query "Exports[?Name==\`PipelineID\`].Value" \
+            --no-paginate --output text > ~/textfile.txt
+      - persist_to_workspace:
+          root: ~/
+          paths: 
+            - textfile.txt 
+
+  promote_to_production:
+    docker:
+      - image: amazon/aws-cli
+    steps:
+      - checkout
+      - run:
+          name: Execute cloudfront.yml
+          command: |
+            aws cloudformation deploy \
+            --template-file cloudfront.yml \
+            --stack-name production-distro \
+            --parameter-overrides PipelineID="mybucket-${CIRCLE_WORKFLOW_ID:0:7}"
+
+
+
+  # Destroy the previous production version's S3 bucket and CloudFormation stack. 
+  clean_up_old_front_end:
+    docker:
+      - image: amazon/aws-cli
+    steps:
+      - checkout
+      - run: yum install -y tar gzip
+      - attach_workspace:
+          at: ~/
+      - run:
+          name: Destroy the previous S3 bucket and CloudFormation stack. 
+          # Use $OldBucketID environment variable or mybucket644752792305 below.
+          # Similarly, you can create and use $OldStackID environment variable in place of production-distro 
+          command: |
+            export OldBucketID=$(cat ~/textfile.txt)
+            aws s3 rm "s3://${OldBucketID}" --recursive
+
+
+  create_infrastructure: 
+      docker:
+        - image: amazon/aws-cli
+      steps:
+        - checkout
+        - run:
+            name: Create Cloudformation Stack
+            command: |
+              aws cloudformation deploy \
+                --template-file template.yml \
+                --stack-name myStack-${CIRCLE_WORKFLOW_ID:0:7} \
+                --region us-east-1
+
+                
+  configure_infrastructure: 
+    docker:
+      - image: python:3.10.4
+    steps:
+      - checkout
+      - add_ssh_keys:
+          fingerprints: ["f5:6b:6e:58:30:42:53:4d:e5:61:df:9c:b0:6d:2d:6d"] 
+      - run:
+          name: Install Ansible
+          command: |
+            # Install Ansible
+            pip install pip  --upgrade 
+            pip install ansible awscli
+            
+      - run:
+          name: Run Playbook and Configure server
+          command: |
+            # Your command
+            #touch inventory
+            echo [all] > inventory
+            aws ec2 describe-instances --query 'Reservations[*].Instances[*].PublicIpAddress'  --output text >> inventory
+            cat inventory
+            ansible-playbook -i inventory main-remote.yml
+      - destroy_environment
+            
+            
+  smoke_test:
+    docker:
+      - image: alpine:latest
+    steps:
+      - run: apk add --update curl
+      - run:
+          name: smoke test
+          command: |
+            URL="https://blog.udacity.com33/"
+            # Test if website exists
+            if curl -s --head ${URL} 
+            then
+              return 0
+            else
+              return 1
+            fi
+      - destroy_environment
+         
+         
+         
+# Sequential workflow
+workflows:
+  # Name the workflow
+  myWorkflow:
+    jobs:
+      # - create_infrastructure
+      # - configure_infrastructure:
+      #     requires:
+      #       - create_infrastructure
+      # - smoke_test:
+      #     requires:
+      #      - configure_infrastructure
+
+
+      - create_and_deploy_front_end
+      - promote_to_production:
+          requires: 
+            - create_and_deploy_front_end
+      - get_last_deployment_id
+      - clean_up_old_front_end:
+          requires:
+            - get_last_deployment_id
+            - promote_to_production
